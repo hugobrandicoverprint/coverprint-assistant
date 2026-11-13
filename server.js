@@ -131,8 +131,9 @@ function listingRequest(question){
   const q=norm(question);
   const coverStyl=/\bcover\s?styl\b/.test(q);
   const grey=/\b(gris|grise|grises|grey|gray|graphite|anthracite)\b/.test(q);
-  const enumeration=/\b(tous|toutes|liste|references|reference|montre|affiche|voir|catalogue)\b/.test(q);
-  return coverStyl && grey && enumeration;
+  // Une demande Cover Styl + couleur exprime une recherche de gamme, meme sans "toutes".
+  // Ex. "je veux un cover styl film gris" ne doit pas etre reduit a trois suggestions IA.
+  return coverStyl && grey;
 }
 function catalogueListing(question){
   // Only explicitly marked shades in product title/tags: no invented color classification.
