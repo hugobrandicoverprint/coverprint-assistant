@@ -7,6 +7,29 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
 const PORT = Number(process.env.PORT || 3000);
 const STORE = 'https://coverprint.fr';
 const TTL = 1000 * 60 * 60 * 3;
+const DB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const DB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+let dbSync = { updatedAt: 0, count: 0, error: null };
+
+async function saveProductsToDatabase(products) {
+  if (!DB_URL || !DB_KEY) return;
+  const dbHeaders = { apikey: DB_KEY, Authorization: `Bearer ${DB_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' };
+  const normalized = products.filter(p=>p.handle).map(p=>({
+    shopify_id:String(p.id),handle:p.handle,title:p.title,description:p.description,
+    product_type:p.type,vendor:p.vendor || null,product_url:p.url,image_url:p.image,
+    status:'active',synced_at:new Date().toISOString()
+  }));
+  // Upserts en petits lots ; Supabase est configuré pour refuser l'accès public.
+  for (let i=0;i<normalized.length;i+=100) {
+    const response = await fetch(`${DB_URL}/rest/v1/cp_products?on_conflict=handle`, {
+      method:'POST',headers:dbHeaders,body:JSON.stringify(normalized.slice(i,i+100)),
+      signal:AbortSignal.timeout(30000)
+    });
+    if (!response.ok) throw new Error(`Supabase HTTP ${response.status}: ${(await response.text()).slice(0,250)}`);
+  }
+  dbSync = {updatedAt:Date.now(),count:normalized.length,error:null};
+  console.log(`Supabase: ${normalized.length} produits synchronisés`);
+}
 let snapshot = { updatedAt: 0, products: [], error: null };
 let pending = null;
 const headers = {'Content-Security-Policy': "default-src 'self'; img-src 'self' https: data:; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; manifest-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin'};
@@ -32,12 +55,16 @@ async function syncCatalog() {
         if (!batch.length) break;
         for (const p of batch) {
           if (!p.handle || !p.title) continue;
-          result.push({ id:p.id, title:p.title, handle:p.handle, description: String(p.body_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').slice(0,5000), type:p.product_type || '', tags: Array.isArray(p.tags) ? p.tags.join(' ') : (p.tags || ''), image:p.images?.[0]?.src || null, available:p.variants?.some(v=>v.available) ?? null, url:`${STORE}/products/${encodeURIComponent(p.handle)}` });
+          result.push({ id:p.id, title:p.title, handle:p.handle, description: String(p.body_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').slice(0,5000), type:p.product_type || '', tags: Array.isArray(p.tags) ? p.tags.join(' ') : (p.tags || ''), image:p.images?.[0]?.src || null, vendor:p.vendor || '', available:p.variants?.some(v=>v.available) ?? null, url:`${STORE}/products/${encodeURIComponent(p.handle)}` });
         }
         if (page === 100) throw new Error('Catalogue trop volumineux : limite de synchronisation atteinte');
       }
       if (!result.length) throw new Error('Aucun produit public renvoyé');
       snapshot = { updatedAt:Date.now(), products:result, error:null };
+      if (DB_URL && DB_KEY) {
+        try { await saveProductsToDatabase(result); }
+        catch (dbError) { dbSync.error=dbError.message; console.error('Synchronisation Supabase :',dbError.message); }
+      }
     } catch(err) {
       snapshot.error = err.message;
       // Preserve prior good snapshot if refresh fails.
@@ -52,6 +79,10 @@ const server = http.createServer(async (req,res)=>{
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
+    if (url.pathname === '/api/sync-status') {
+      res.writeHead(200, {...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
+      return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error}));
+    }
     if (url.pathname === '/api/catalog') {
       if (!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL) await syncCatalog();
       res.writeHead(200, {...headers, 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'public, max-age=180'});
