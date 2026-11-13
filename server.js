@@ -143,6 +143,24 @@ function catalogueListing(question){
   }).sort((a,b)=>a.title.localeCompare(b.title,'fr'));
   return {reply:results.length ? `J’ai trouvé ${results.length} références Cover Styl explicitement identifiées comme grises, Grey/Gray, Graphite ou Anthracite dans les noms ou tags du catalogue. Voici la liste ; cliquez sur « Afficher la suite » pour les parcourir. D’autres décors peuvent paraître gris sans être nommés ainsi : ils ne sont pas inclus automatiquement.` : 'Aucune référence ne porte explicitement ces mots de couleur dans son nom ou ses tags. Je ne peux pas garantir un inventaire visuel exhaustif sans données couleur vérifiées.',products:results.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'catalogue-exhaustif',total:results.length};
 }
+// Reconstitue une précision courte envoyée par l'interface (ex. « bla,n » => « blanc »).
+// L'ancienne demande reste le cahier des charges ; la précision est une préférence.
+function parseFollowup(question){
+  const m=String(question).match(/^Demande précédente\s*:\s*([\s\S]*?)\.\s*Réponse du client à la dernière question\s*:\s*([\s\S]*?)\.\s*Tenez compte de cette précision/i);
+  if(!m)return null;
+  const goal=m[1].trim();
+  let value=m[2].trim();
+  if(/^bla\s*[,.;-]?\s*n(?:c)?$/i.test(value)||/^blnac$/i.test(value))value='blanc';
+  const n=norm(value);
+  const shade=/^(blanc|blanche|white|transparent|transparente|noir|noire|gris|grise|gray|grey)$/.test(n)?n:null;
+  return {goal,value,shade};
+}
+function matchesShade(p,shade){
+  if(!shade)return true;
+  const text=norm(p.title+' '+p.tags+' '+p.description.slice(0,250));
+  const synonyms={blanc:/\b(blanc|blanche|white)\b/,blanche:/\b(blanc|blanche|white)\b/,white:/\b(blanc|blanche|white)\b/,transparent:/\b(transparent|transparente|clear)\b/,transparente:/\b(transparent|transparente|clear)\b/,noir:/\b(noir|noire|black)\b/,noire:/\b(noir|noire|black)\b/,gris:/\b(gris|grise|gray|grey)\b/,grise:/\b(gris|grise|gray|grey)\b/,gray:/\b(gris|grise|gray|grey)\b/,grey:/\b(gris|grise|gray|grey)\b/};
+  return Boolean(synonyms[shade]?.test(text));
+}
 async function advise(question, history=[]){
   if(!snapshot.updatedAt) {
     // En cas de démarrage à froid, le premier catalogue doit être chargé.
@@ -151,21 +169,31 @@ async function advise(question, history=[]){
     // Le catalogue déjà chargé reste exploitable pendant son actualisation.
     void syncCatalog();
   }
-  // Les critères obligatoires proviennent uniquement de la demande actuelle.
+  // Sur une précision courte, les critères obligatoires viennent du besoin précédent,
+  // tandis que la couleur ne peut pas remplacer ces critères.
+  const followup=parseFollowup(question);
+  const effectiveQuestion=followup?followup.goal:question;
+  // Les critères obligatoires proviennent du besoin actif, jamais des autres anciens projets.
   // Ne jamais réinjecter un ancien besoin rejeté dans les filtres.
-  if(listingRequest(question)) return catalogueListing(question);
-  const c0=getConstraints(question);
+  if(!followup && listingRequest(question)) return catalogueListing(question);
+  const c0=getConstraints(effectiveQuestion);
   if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
-  const {products,c}=shortlist(question);
+  const initial=shortlist(effectiveQuestion);
+  const products=followup?.shade?initial.products.filter(p=>matchesShade(p,followup.shade)):initial.products;
+  const c=initial.c;
+  if(!products.length && followup){
+    const color=followup.shade?`la finition « ${followup.value} »`:`la précision « ${followup.value} »`;
+    return {reply:`J’ai compris ${color}. Je conserve votre besoin initial : ${followup.goal}. Cependant, les fiches publiques ne me permettent pas de confirmer un produit réunissant ces critères. Je préfère vous le signaler plutôt que d’inventer une compatibilité. Souhaitez-vous que je cherche une alternative ou que nous vérifiions une fiche technique ?`,products:[],source:'clarification-non-confirmee'};
+  }
   if(!products.length)return {reply:'Je ne trouve aucun produit dont les données disponibles confirment tous vos critères. Pouvez-vous préciser votre besoin ? Je préfère ne pas vous orienter vers une référence incompatible.',products:[],source:'verified-filter'};
   if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword'};
   const context=Array.isArray(history)?history.slice(-5).filter(x=>typeof x==='string').map(x=>x.slice(0,350)):[];
   const candidateData=products.map(p=>({id:p.id,title:p.title,type:p.type,tags:p.tags,description:p.description.slice(0,1100)}));
-  const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Les messages précédents sont fournis uniquement comme contexte : la dernière demande est prioritaire. Si le client change d'avis, oublie les anciennes contraintes. Ne discute jamais d'impression si la demande actuelle concerne seulement un film solaire. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
+  const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Les messages précédents sont fournis uniquement comme contexte : la dernière demande est prioritaire. Si le client change d'avis, oublie les anciennes contraintes. Si le client a précisé une couleur, reconnais cette réponse et conserve le besoin précédent. Ne discute jamais d'impression si la demande actuelle concerne seulement un film solaire. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
   // Gemini REST : la clé reste côté serveur Render, jamais dans le navigateur.
   const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(AI_MODEL)}:generateContent`,{
     method:'POST',headers:{'x-goog-api-key':AI_KEY,'Content-Type':'application/json'},
-    body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify({derniere_demande:question,messages_precedents_pour_contexte:context,contraintes_actuelles:c,candidats:candidateData})}]}],generationConfig:{responseMimeType:'application/json',temperature:0.1,maxOutputTokens:1200}}),
+    body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify({derniere_demande:effectiveQuestion,precision_du_client:followup?.value||null,messages_precedents_pour_contexte:context,contraintes_actuelles:c,candidats:candidateData})}]}],generationConfig:{responseMimeType:'application/json',temperature:0.1,maxOutputTokens:1200}}),
     signal:AbortSignal.timeout(45000)
   });
   if(!response.ok){
