@@ -66,9 +66,13 @@ async function syncCatalog() {
       }
       if (!result.length) throw new Error('Aucun produit public renvoyé');
       snapshot = { updatedAt:Date.now(), products:result, error:null };
+      // Ne jamais bloquer une demande client sur la sauvegarde en base.
+      // Les produits chargés sont immédiatement utilisables par le conseiller IA.
       if (DB_URL && DB_KEY) {
-        try { await saveProductsToDatabase(result); }
-        catch (dbError) { dbSync.error=String(dbError.message).replaceAll(DB_KEY, '[CLÉ MASQUÉE]'); console.error('Synchronisation Supabase :',dbSync.error); }
+        void saveProductsToDatabase(result).catch(dbError => {
+          dbSync.error=String(dbError.message).replaceAll(DB_KEY, '[CLÉ MASQUÉE]');
+          console.error('Synchronisation Supabase :', dbSync.error);
+        });
       }
     } catch(err) {
       snapshot.error = err.message;
@@ -88,12 +92,15 @@ function getConstraints(question){
     lowTack:/\b(low tack|lowtack|faible adherence)\b/.test(q),
     latex:/\blatex\b/.test(q), uv:/\b(impression uv|imprimable uv|encre uv)\b/.test(q),
     eco:/\b(eco solvant|ecosolvant)\b/.test(q),
+    sol:/\b(pour le sol|au sol|sur le sol|poser au sol|revetement de sol|marquage au sol)\b/.test(q),
     interieur:/\b(pose interieure|pose a l interieur|film interieur)\b/.test(q),
     exterieur:/\b(pose exterieure|pose a l exterieur|film exterieur)\b/.test(q)};
 }
 function eligible(p,c){
   const title=norm(p.title), evidence=norm([p.title,p.type,p.tags,p.description].join(' '));
   if(forbidden.test(evidence))return false;
+  if(c.sol && !/\b(sol|plancher|floor|floor graphic|floorgraphics)\b/.test(norm(p.title+' '+p.type+' '+p.tags)))return false;
+  if(c.sol && /\b(vitrage|film solaire|film de securite|pour vitre)\b/.test(title))return false;
   // En cas de doute on élimine, jamais d'inférence technique par le LLM.
   if(c.sansColle && !/\b(sans colle|sans adhesif|non adhesif|electrostatique|static cling)\b/.test(evidence))return false;
   if(c.sansColle && /\b(adhesif permanent|colle permanente|low tack|lowtack)\b/.test(evidence))return false;
@@ -118,7 +125,13 @@ function shortlist(question){
   return {products,c};
 }
 async function advise(question){
-  if(!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL)await syncCatalog();
+  if(!snapshot.updatedAt) {
+    // En cas de démarrage à froid, le premier catalogue doit être chargé.
+    await Promise.race([syncCatalog(), new Promise((_, reject)=>setTimeout(()=>reject(new Error('Catalogue en cours de chargement : réessayez dans un instant.')), 25000))]);
+  } else if(Date.now()-snapshot.updatedAt>TTL) {
+    // Le catalogue déjà chargé reste exploitable pendant son actualisation.
+    void syncCatalog();
+  }
   const c0=getConstraints(question);
   if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
   const {products,c}=shortlist(question);
@@ -145,12 +158,12 @@ const server = http.createServer(async (req,res)=>{
       const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);
       if(!question){res.writeHead(400,headers);return res.end('Question requise');}
       try {const answer=await advise(question);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
-      catch(e){console.error('Conseil :',(AI_KEY ? String(e.message).replaceAll(AI_KEY,'[MASQUÉ]') : String(e.message)));res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:'Le conseiller est momentanément indisponible. Merci de reformuler votre demande.',products:[]}));}
+      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':'Le conseiller IA n’a pas pu répondre. Vérifiez la configuration OpenAI et les logs Render.',products:[],error:'service_unavailable'}));}
     }
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
     if (url.pathname === '/api/sync-status') {
       res.writeHead(200, {...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
-      return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error}));
+      return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error, aiConfigured:Boolean(AI_KEY)}));
     }
     if (url.pathname === '/api/catalog') {
       if (!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL) await syncCatalog();
@@ -170,3 +183,6 @@ const server = http.createServer(async (req,res)=>{
   } catch { res.writeHead(404, headers); res.end('Introuvable'); }
 });
 server.listen(PORT, '0.0.0.0', ()=>console.log(`Coverprint Assistant : http://localhost:${PORT}`));
+
+// Précharge le catalogue dès le démarrage, sans bloquer le serveur HTTP.
+setImmediate(()=>{ void syncCatalog().catch(err=>console.error('Préchargement catalogue:', String(err.message))); });
