@@ -8,12 +8,15 @@ const PORT = Number(process.env.PORT || 3000);
 const STORE = 'https://coverprint.fr';
 const TTL = 1000 * 60 * 60 * 3;
 const DB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const DB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const DB_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 let dbSync = { updatedAt: 0, count: 0, error: null };
 
 async function saveProductsToDatabase(products) {
   if (!DB_URL || !DB_KEY) return;
-  const dbHeaders = { apikey: DB_KEY, Authorization: `Bearer ${DB_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' };
+  // Supabase sb_secret_* keys are NOT JWTs: send them as apikey only.
+  // Legacy service_role JWTs can still be used as Bearer tokens.
+  const dbHeaders = { apikey: DB_KEY, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' };
+  if (!DB_KEY.startsWith('sb_secret_')) dbHeaders.Authorization = `Bearer ${DB_KEY}`;
   const normalized = products.filter(p=>p.handle).map(p=>({
     shopify_id:String(p.id),handle:p.handle,title:p.title,description:p.description,
     product_type:p.type,vendor:p.vendor || null,product_url:p.url,image_url:p.image,
@@ -63,7 +66,7 @@ async function syncCatalog() {
       snapshot = { updatedAt:Date.now(), products:result, error:null };
       if (DB_URL && DB_KEY) {
         try { await saveProductsToDatabase(result); }
-        catch (dbError) { dbSync.error=dbError.message; console.error('Synchronisation Supabase :',dbError.message); }
+        catch (dbError) { dbSync.error=String(dbError.message).replaceAll(DB_KEY, '[CLÉ MASQUÉE]'); console.error('Synchronisation Supabase :',dbSync.error); }
       }
     } catch(err) {
       snapshot.error = err.message;
@@ -85,6 +88,10 @@ const server = http.createServer(async (req,res)=>{
     }
     if (url.pathname === '/api/catalog') {
       if (!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL) await syncCatalog();
+      else if (DB_URL && DB_KEY && dbSync.count === 0) {
+        try { await saveProductsToDatabase(snapshot.products); }
+        catch (dbError) { dbSync.error=String(dbError.message).replaceAll(DB_KEY, '[CLÉ MASQUÉE]'); console.error('Synchronisation Supabase :',dbSync.error); }
+      }
       res.writeHead(200, {...headers, 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'public, max-age=180'});
       return res.end(JSON.stringify({products:snapshot.products, count:snapshot.products.length, updatedAt:snapshot.updatedAt, source:snapshot.products.length?'live':'demo', error:snapshot.error}));
     }
