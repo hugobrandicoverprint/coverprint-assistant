@@ -88,7 +88,8 @@ const norm = x => String(x||'').toLowerCase().normalize('NFD').replace(/[\u0300-
 const forbidden = /\b(masquer catalogue|masquer-catalogue|decoupe sur mesure produit technique)\b/;
 function getConstraints(question){
   const q=norm(question);
-  return {sansColle:/\b(sans colle|sans adhesif|non adhesif|electrostatique|statique sans colle)\b/.test(q),
+  const glueNegated = /\b(ne veux pas|veux pas|pas besoin de|plus besoin de|m en fou|je m en fiche|oublie|sans importance)\b.{0,35}\b(sans colle|sans adhesif|electrostatique)\b/.test(q);
+  return {sansColle:!glueNegated && /\b(sans colle|sans adhesif|non adhesif|electrostatique|statique sans colle)\b/.test(q),
     lowTack:/\b(low tack|lowtack|faible adherence)\b/.test(q),
     latex:/\blatex\b/.test(q), uv:/\b(impression uv|imprimable uv|encre uv)\b/.test(q),
     eco:/\b(eco solvant|ecosolvant)\b/.test(q),
@@ -124,7 +125,7 @@ function shortlist(question){
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,25).map(x=>x.p);
   return {products,c};
 }
-async function advise(question){
+async function advise(question, history=[]){
   if(!snapshot.updatedAt) {
     // En cas de démarrage à froid, le premier catalogue doit être chargé.
     await Promise.race([syncCatalog(), new Promise((_, reject)=>setTimeout(()=>reject(new Error('Catalogue en cours de chargement : réessayez dans un instant.')), 25000))]);
@@ -132,23 +133,26 @@ async function advise(question){
     // Le catalogue déjà chargé reste exploitable pendant son actualisation.
     void syncCatalog();
   }
+  // Les critères obligatoires proviennent uniquement de la demande actuelle.
+  // Ne jamais réinjecter un ancien besoin rejeté dans les filtres.
   const c0=getConstraints(question);
   if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
   const {products,c}=shortlist(question);
   if(!products.length)return {reply:'Je ne trouve aucun produit dont les données disponibles confirment tous vos critères. Pouvez-vous préciser votre besoin ? Je préfère ne pas vous orienter vers une référence incompatible.',products:[],source:'verified-filter'};
   if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword'};
+  const context=Array.isArray(history)?history.slice(-5).filter(x=>typeof x==='string').map(x=>x.slice(0,350)):[];
   const candidateData=products.map(p=>({id:p.id,title:p.title,type:p.type,tags:p.tags,description:p.description.slice(0,1100)}));
-  const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
+  const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Les messages précédents sont fournis uniquement comme contexte : la dernière demande est prioritaire. Si le client change d'avis, oublie les anciennes contraintes. Ne discute jamais d'impression si la demande actuelle concerne seulement un film solaire. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
   // Gemini REST : la clé reste côté serveur Render, jamais dans le navigateur.
   const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(AI_MODEL)}:generateContent`,{
     method:'POST',headers:{'x-goog-api-key':AI_KEY,'Content-Type':'application/json'},
-    body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify({question,contraintes:c,candidats:candidateData})}]}],generationConfig:{responseMimeType:'application/json',temperature:0.1,maxOutputTokens:1200}}),
+    body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify({derniere_demande:question,messages_precedents_pour_contexte:context,contraintes_actuelles:c,candidats:candidateData})}]}],generationConfig:{responseMimeType:'application/json',temperature:0.1,maxOutputTokens:1200}}),
     signal:AbortSignal.timeout(45000)
   });
   if(!response.ok){
     const body=(await response.text()).slice(0,400);
     // Aucun secret ni corps de la demande dans les logs.
-    throw new Error(`Gemini HTTP ${response.status}${/quota|limit|billing/i.test(body)?' (quota ou limite du forfait)':''}`);
+    throw new Error(`Gemini HTTP ${response.status}${/quota|limit|billing|resource_exhausted/i.test(body)?' (quota ou limite du forfait)':''}`);
   }
   const data=await response.json();
   const raw=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim();
@@ -168,10 +172,10 @@ const server = http.createServer(async (req,res)=>{
       const ip=(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').toString().split(',')[0];
       const now=Date.now();const h=usage.get(ip)||{since:now,count:0};if(now-h.since>60000){h.since=now;h.count=0;}h.count++;usage.set(ip,h);
       if(h.count>12){res.writeHead(429,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:'Trop de demandes. Réessayez dans une minute.',products:[]}));}
-      const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);
+      const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);const history=Array.isArray(body.history)?body.history:[];
       if(!question){res.writeHead(400,headers);return res.end('Question requise');}
-      try {const answer=await advise(question);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
-      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':'Le conseiller IA n’a pas pu répondre. Vérifiez les quotas Gemini et les logs Render.',products:[],error:'service_unavailable'}));}
+      try {const answer=await advise(question,history);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
+      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':diagnostic.includes('HTTP 429')?'Le quota gratuit Gemini est atteint ou une limite de débit est dépassée. Consultez Google AI Studio → Limite de débit, puis réessayez après réinitialisation du quota. Aucune recommandation non vérifiée ne sera affichée.':diagnostic.includes('HTTP 404')?'Le modèle Gemini configuré est introuvable ou indisponible. Vérifiez GEMINI_MODEL dans Render.':'Le service Gemini n’a pas répondu. Consultez les logs Render pour identifier la cause.',products:[],error:'service_unavailable'}));}
     }
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
     if (url.pathname === '/api/sync-status') {
