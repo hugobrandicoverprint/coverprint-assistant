@@ -169,9 +169,16 @@ async function advise(question, history=[]){
     signal:AbortSignal.timeout(45000)
   });
   if(!response.ok){
-    const body=(await response.text()).slice(0,400);
-    // Aucun secret ni corps de la demande dans les logs.
-    throw new Error(`Gemini HTTP ${response.status}${/quota|limit|billing|resource_exhausted/i.test(body)?' (quota ou limite du forfait)':''}`);
+    const body=(await response.text()).slice(0,3500);
+    // Extraire le message Google sans publier de clé ni contenu des questions.
+    let googleCode='';let googleMessage='';
+    try {const err=JSON.parse(body).error||{};googleCode=String(err.status||'');googleMessage=String(err.message||'');}catch{}
+    const classification= /RESOURCE_EXHAUSTED|quota|rate limit|limit exceeded/i.test(googleCode+' '+googleMessage)?'QUOTA':
+      /API_KEY_INVALID|API key not valid|key expired/i.test(googleCode+' '+googleMessage)?'CLE_INVALIDE':
+      /model|not found|is not supported/i.test(googleMessage)?'MODELE_INDISPONIBLE':
+      /PERMISSION_DENIED|permission/i.test(googleCode+' '+googleMessage)?'AUTORISATION':'AUTRE';
+    // Ne journaliser que l'état HTTP, le code et le type d'erreur.
+    throw new Error(`Gemini HTTP ${response.status} [${classification}] ${googleCode}`);
   }
   const data=await response.json();
   const raw=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim();
@@ -194,7 +201,7 @@ const server = http.createServer(async (req,res)=>{
       const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);const history=Array.isArray(body.history)?body.history:[];
       if(!question){res.writeHead(400,headers);return res.end('Question requise');}
       try {const answer=await advise(question,history);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
-      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':diagnostic.includes('HTTP 429')?'Le quota gratuit Gemini est atteint ou une limite de débit est dépassée. Consultez Google AI Studio → Limite de débit, puis réessayez après réinitialisation du quota. Aucune recommandation non vérifiée ne sera affichée.':diagnostic.includes('HTTP 404')?'Le modèle Gemini configuré est introuvable ou indisponible. Vérifiez GEMINI_MODEL dans Render.':'Le service Gemini n’a pas répondu. Consultez les logs Render pour identifier la cause.',products:[],error:'service_unavailable'}));}
+      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':diagnostic.includes('[QUOTA]')?'La limite de l’IA gratuite Gemini est atteinte pour le moment. Les produits Coverprint restent accessibles, mais les réponses IA sont suspendues.':diagnostic.includes('[CLE_INVALIDE]')?'La clé Gemini est refusée. Vérifiez GEMINI_API_KEY dans Render.':diagnostic.includes('[MODELE_INDISPONIBLE]')||diagnostic.includes('HTTP 404')?'Le modèle Gemini est indisponible. Vérifiez GEMINI_MODEL dans Render.':diagnostic.includes('[AUTORISATION]')?'Votre projet Google n’autorise pas ce modèle Gemini. Vérifiez les permissions et le forfait dans AI Studio.':'L’IA est momentanément indisponible. Consultez les logs Render pour voir le code d’erreur précis.',products:[],error:'service_unavailable'}));}
     }
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
     if (url.pathname === '/api/sync-status') {
