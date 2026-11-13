@@ -125,6 +125,24 @@ function shortlist(question){
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,25).map(x=>x.p);
   return {products,c};
 }
+function listingRequest(question){
+  const q=norm(question);
+  const coverStyl=/\bcover\s?styl\b/.test(q);
+  const grey=/\b(gris|grise|grises|grey|gray|graphite|anthracite)\b/.test(q);
+  const enumeration=/\b(tous|toutes|liste|references|reference|montre|affiche|voir|catalogue)\b/.test(q);
+  return coverStyl && grey && enumeration;
+}
+function catalogueListing(question){
+  // Only explicitly marked shades in product title/tags: no invented color classification.
+  const results=snapshot.products.filter(p=>{
+    const title=norm(p.title), tags=norm(p.tags), handle=norm(p.handle);
+    if(!(/\bcover styl\b/.test(title+' '+tags+' '+handle))) return false;
+    if(/nuancier|echantillon|book|kit|accessoire|outil/.test(title)) return false;
+    if(!/\b(gris|grise|grises|grey|gray|graphite|anthracite)\b/.test(title+' '+tags)) return false;
+    return p.available!==false && !forbidden.test(norm(p.title+' '+p.tags));
+  }).sort((a,b)=>a.title.localeCompare(b.title,'fr'));
+  return {reply:results.length ? `J’ai trouvé ${results.length} références Cover Styl explicitement identifiées comme grises, Grey/Gray, Graphite ou Anthracite dans les noms ou tags du catalogue. Voici la liste ; cliquez sur « Afficher la suite » pour les parcourir. D’autres décors peuvent paraître gris sans être nommés ainsi : ils ne sont pas inclus automatiquement.` : 'Aucune référence ne porte explicitement ces mots de couleur dans son nom ou ses tags. Je ne peux pas garantir un inventaire visuel exhaustif sans données couleur vérifiées.',products:results.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'catalogue-exhaustif',total:results.length};
+}
 async function advise(question, history=[]){
   if(!snapshot.updatedAt) {
     // En cas de démarrage à froid, le premier catalogue doit être chargé.
@@ -135,6 +153,7 @@ async function advise(question, history=[]){
   }
   // Les critères obligatoires proviennent uniquement de la demande actuelle.
   // Ne jamais réinjecter un ancien besoin rejeté dans les filtres.
+  if(listingRequest(question)) return catalogueListing(question);
   const c0=getConstraints(question);
   if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
   const {products,c}=shortlist(question);
