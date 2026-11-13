@@ -9,6 +9,8 @@ const STORE = 'https://coverprint.fr';
 const TTL = 1000 * 60 * 60 * 3;
 const DB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const DB_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const AI_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 let dbSync = { updatedAt: 0, count: 0, error: null };
 
 async function saveProductsToDatabase(products) {
@@ -20,7 +22,7 @@ async function saveProductsToDatabase(products) {
   const normalized = products.filter(p=>p.handle).map(p=>({
     shopify_id:String(p.id),handle:p.handle,title:p.title,description:p.description,
     product_type:p.type,vendor:p.vendor || null,product_url:p.url,image_url:p.image,
-    status:'active',synced_at:new Date().toISOString()
+    status:'active',synced_at:new Date().toISOString(),tags_raw:p.tags || ''
   }));
   // Upserts en petits lots ; Supabase est configuré pour refuser l'accès public.
   for (let i=0;i<normalized.length;i+=100) {
@@ -58,7 +60,7 @@ async function syncCatalog() {
         if (!batch.length) break;
         for (const p of batch) {
           if (!p.handle || !p.title) continue;
-          result.push({ id:p.id, title:p.title, handle:p.handle, description: String(p.body_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').slice(0,5000), type:p.product_type || '', tags: Array.isArray(p.tags) ? p.tags.join(' ') : (p.tags || ''), image:p.images?.[0]?.src || null, vendor:p.vendor || '', available:p.variants?.some(v=>v.available) ?? null, url:`${STORE}/products/${encodeURIComponent(p.handle)}` });
+          result.push({ id:p.id, title:p.title, handle:p.handle, description: String(p.body_html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&eacute;/g,'é').slice(0,5000), type:p.product_type || '', tags: Array.isArray(p.tags) ? p.tags.join(' ') : (p.tags || ''), image:p.images?.[0]?.src || null, vendor:p.vendor || '', available:p.variants?.some(v=>v.available) ?? null, variants:(p.variants||[]).map(v=>({id:String(v.id),title:v.title,sku:v.sku||'',price:v.price,available:v.available})), url:`${STORE}/products/${encodeURIComponent(p.handle)}` });
         }
         if (page === 100) throw new Error('Catalogue trop volumineux : limite de synchronisation atteinte');
       }
@@ -77,10 +79,74 @@ async function syncCatalog() {
   return pending;
 }
 
+// Les contraintes obligatoires sont appliquées AVANT le modèle IA.
+const norm = x => String(x||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim();
+const forbidden = /\b(masquer catalogue|masquer-catalogue|decoupe sur mesure produit technique)\b/;
+function getConstraints(question){
+  const q=norm(question);
+  return {sansColle:/\b(sans colle|sans adhesif|non adhesif|electrostatique|statique sans colle)\b/.test(q),
+    lowTack:/\b(low tack|lowtack|faible adherence)\b/.test(q),
+    latex:/\blatex\b/.test(q), uv:/\b(impression uv|imprimable uv|encre uv)\b/.test(q),
+    eco:/\b(eco solvant|ecosolvant)\b/.test(q),
+    interieur:/\b(pose interieure|pose a l interieur|film interieur)\b/.test(q),
+    exterieur:/\b(pose exterieure|pose a l exterieur|film exterieur)\b/.test(q)};
+}
+function eligible(p,c){
+  const title=norm(p.title), evidence=norm([p.title,p.type,p.tags,p.description].join(' '));
+  if(forbidden.test(evidence))return false;
+  // En cas de doute on élimine, jamais d'inférence technique par le LLM.
+  if(c.sansColle && !/\b(sans colle|sans adhesif|non adhesif|electrostatique|static cling)\b/.test(evidence))return false;
+  if(c.sansColle && /\b(adhesif permanent|colle permanente|low tack|lowtack)\b/.test(evidence))return false;
+  if(c.lowTack && !/\b(low tack|lowtack|faible adherence)\b/.test(evidence))return false;
+  if(c.latex && (!/\blatex\b/.test(evidence) || /\b(non compatible latex|pas compatible latex|latex non compatible)\b/.test(evidence)))return false;
+  if(c.uv && !/\b(impression uv|imprimable uv|uv led|uv print)\b/.test(evidence))return false;
+  if(c.eco && !/\b(eco solvant|ecosolvant)\b/.test(evidence))return false;
+  if(c.interieur && /\b(exterieur uniquement|pose exterieure uniquement)\b/.test(evidence))return false;
+  if(c.exterieur && /\b(interieur uniquement|pose interieure uniquement)\b/.test(evidence))return false;
+  if(p.available===false)return false;
+  return true;
+}
+function shortlist(question){
+  const c=getConstraints(question), q=norm(question), tokens=q.split(' ').filter(t=>t.length>3&&!['cherche','pour','avec','dans','sans','produit','besoin','veux','film'].includes(t));
+  const products=snapshot.products.filter(p=>eligible(p,c)).map(p=>{
+    const name=norm(p.title), tags=norm(p.tags+' '+p.type), desc=norm(p.description);
+    let score=0;for(const t of tokens){if(name.includes(t))score+=8;if(tags.includes(t))score+=5;if(desc.includes(t))score+=1;}
+    if(c.sansColle && /sans colle|electrostatique/.test(name+' '+tags))score+=15;
+    if(c.lowTack && /low tack/.test(name+' '+tags))score+=15;
+    return {p,score};
+  }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,25).map(x=>x.p);
+  return {products,c};
+}
+async function advise(question){
+  if(!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL)await syncCatalog();
+  const c0=getConstraints(question);
+  if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
+  const {products,c}=shortlist(question);
+  if(!products.length)return {reply:'Je ne trouve aucun produit dont les données disponibles confirment tous vos critères. Pouvez-vous préciser votre besoin ? Je préfère ne pas vous orienter vers une référence incompatible.',products:[],source:'verified-filter'};
+  if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword'};
+  const candidateData=products.map(p=>({id:p.id,title:p.title,type:p.type,tags:p.tags,description:p.description.slice(0,1100)}));
+  const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
+  const response=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${AI_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:AI_MODEL,temperature:0,messages:[{role:'system',content:sys},{role:'user',content:JSON.stringify({question,contraintes:c,candidats:candidateData})}],response_format:{type:'json_object'}}),signal:AbortSignal.timeout(30000)});
+  if(!response.ok)throw new Error(`Service IA indisponible (${response.status})`);
+  const data=await response.json();const answer=JSON.parse(data.choices?.[0]?.message?.content||'{}');
+  const allowed=new Map(products.map(p=>[String(p.id),p]));const selected=(Array.isArray(answer.ids)?answer.ids:[]).map(id=>allowed.get(String(id))).filter(Boolean).slice(0,3);
+  return {reply:String(answer.reply||'Pouvez-vous préciser votre projet ?').slice(0,1200),products:selected.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'ai-with-hard-filters'};
+}
+async function readJson(req){let data='';for await(const chunk of req){data+=chunk;if(data.length>10000)throw new Error('Demande trop longue');}return JSON.parse(data||'{}');}
+const usage=new Map();
 const mime = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'};
 const server = http.createServer(async (req,res)=>{
   try {
     const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'POST' && url.pathname === '/api/advise') {
+      const ip=(req.headers['x-forwarded-for']||req.socket.remoteAddress||'unknown').toString().split(',')[0];
+      const now=Date.now();const h=usage.get(ip)||{since:now,count:0};if(now-h.since>60000){h.since=now;h.count=0;}h.count++;usage.set(ip,h);
+      if(h.count>12){res.writeHead(429,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:'Trop de demandes. Réessayez dans une minute.',products:[]}));}
+      const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);
+      if(!question){res.writeHead(400,headers);return res.end('Question requise');}
+      try {const answer=await advise(question);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
+      catch(e){console.error('Conseil :',(AI_KEY ? String(e.message).replaceAll(AI_KEY,'[MASQUÉ]') : String(e.message)));res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:'Le conseiller est momentanément indisponible. Merci de reformuler votre demande.',products:[]}));}
+    }
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
     if (url.pathname === '/api/sync-status') {
       res.writeHead(200, {...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
