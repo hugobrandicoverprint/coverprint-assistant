@@ -9,8 +9,8 @@ const STORE = 'https://coverprint.fr';
 const TTL = 1000 * 60 * 60 * 3;
 const DB_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const DB_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-const AI_KEY = (process.env.OPENAI_API_KEY || '').trim();
-const AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const AI_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const AI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 let dbSync = { updatedAt: 0, count: 0, error: null };
 
 async function saveProductsToDatabase(products) {
@@ -139,9 +139,22 @@ async function advise(question){
   if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword'};
   const candidateData=products.map(p=>({id:p.id,title:p.title,type:p.type,tags:p.tags,description:p.description.slice(0,1100)}));
   const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
-  const response=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${AI_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:AI_MODEL,temperature:0,messages:[{role:'system',content:sys},{role:'user',content:JSON.stringify({question,contraintes:c,candidats:candidateData})}],response_format:{type:'json_object'}}),signal:AbortSignal.timeout(30000)});
-  if(!response.ok)throw new Error(`Service IA indisponible (${response.status})`);
-  const data=await response.json();const answer=JSON.parse(data.choices?.[0]?.message?.content||'{}');
+  // Gemini REST : la clé reste côté serveur Render, jamais dans le navigateur.
+  const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(AI_MODEL)}:generateContent`,{
+    method:'POST',headers:{'x-goog-api-key':AI_KEY,'Content-Type':'application/json'},
+    body:JSON.stringify({systemInstruction:{parts:[{text:sys}]},contents:[{role:'user',parts:[{text:JSON.stringify({question,contraintes:c,candidats:candidateData})}]}],generationConfig:{responseMimeType:'application/json',temperature:0.1,maxOutputTokens:1200}}),
+    signal:AbortSignal.timeout(45000)
+  });
+  if(!response.ok){
+    const body=(await response.text()).slice(0,400);
+    // Aucun secret ni corps de la demande dans les logs.
+    throw new Error(`Gemini HTTP ${response.status}${/quota|limit|billing/i.test(body)?' (quota ou limite du forfait)':''}`);
+  }
+  const data=await response.json();
+  const raw=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim();
+  if(!raw)throw new Error('Gemini : réponse vide ou filtrée');
+  let answer;
+  try {answer=JSON.parse(raw);} catch {throw new Error('Gemini : réponse non JSON');}
   const allowed=new Map(products.map(p=>[String(p.id),p]));const selected=(Array.isArray(answer.ids)?answer.ids:[]).map(id=>allowed.get(String(id))).filter(Boolean).slice(0,3);
   return {reply:String(answer.reply||'Pouvez-vous préciser votre projet ?').slice(0,1200),products:selected.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'ai-with-hard-filters'};
 }
@@ -158,12 +171,12 @@ const server = http.createServer(async (req,res)=>{
       const body=await readJson(req);const question=String(body.question||'').trim().slice(0,1200);
       if(!question){res.writeHead(400,headers);return res.end('Question requise');}
       try {const answer=await advise(question);res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});return res.end(JSON.stringify(answer));}
-      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':'Le conseiller IA n’a pas pu répondre. Vérifiez la configuration OpenAI et les logs Render.',products:[],error:'service_unavailable'}));}
+      catch(e){const diagnostic=String(e.message).replaceAll(AI_KEY||'__aucune_cle__','[MASQUÉ]'); console.error('Conseil :',diagnostic);res.writeHead(503,{...headers,'Content-Type':'application/json'});return res.end(JSON.stringify({reply:diagnostic.includes('Catalogue en cours')?'Le catalogue se charge après le redémarrage de l’application. Veuillez réessayer dans quelques instants.':'Le conseiller IA n’a pas pu répondre. Vérifiez les quotas Gemini et les logs Render.',products:[],error:'service_unavailable'}));}
     }
     if (req.method !== 'GET') { res.writeHead(405, headers); return res.end(); }
     if (url.pathname === '/api/sync-status') {
       res.writeHead(200, {...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
-      return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error, aiConfigured:Boolean(AI_KEY)}));
+      return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error, aiConfigured:Boolean(AI_KEY),aiProvider:'Gemini',aiModel:AI_MODEL}));
     }
     if (url.pathname === '/api/catalog') {
       if (!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL) await syncCatalog();
