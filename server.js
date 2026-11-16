@@ -194,7 +194,7 @@ function parseCatalogFilters(question){
   else if(/\b(outillage|outil|raclette|cutter|display|roll up)\b/.test(q))family='Outillages & displays';
   const color=COLORS.find(c=>c.re.test(q))?.name||null;
   // La recherche blanche « papier » n'est pas une couleur blanche.
-  const subtype=SUBTYPES.find(x=>x.re.test(q))?.name||null;
+  const subtype=/\b(gamme couleur|gamme color|categorie couleur|uniquement couleur|seulement couleur|que de la couleur|dans les couleurs)\b/.test(q) ? 'gamme couleur' : SUBTYPES.find(x=>x.re.test(q))?.name||null;
   const constraints=getConstraints(question);
   const hasCriteria=Boolean(family||color||subtype||Object.values(constraints).some(Boolean));
   return {family,color,subtype,constraints,hasCriteria};
@@ -220,6 +220,7 @@ function matchColor(p,color){
 }
 function matchSubtype(p,subtype){
   if(!subtype)return true;
+  if(subtype==='gamme couleur')return /\b(couleur\s*\/\s*color|color standard|color premium|color prestige)\b/i.test(p.title);
   const text=norm(p.title+' '+p.type+' '+p.tags);
   if(subtype==='solaire')return /\b(solaire|anti chaleur|thermique)\b/.test(text);
   if(subtype==='papier peint')return /\b(papier peint|wallpaper)\b/.test(text);
@@ -327,6 +328,24 @@ async function generateGeminiWithRecovery(payload){
   throw lastError || new Error('Gemini : service temporairement indisponible [TEMPORAIRE]');
 }
 
+// Une précision de gamme complète les critères précédents au lieu de relancer
+// une sélection Gemini de 0 à 3 produits. Pas de recherche à partir de la
+// réponse rédigée par l'IA : seules les demandes explicites du client comptent.
+function refineCatalogQuestion(question, history){
+  const q=norm(question);
+  const wantsColorRange=/^(?:que de la couleur|uniquement (?:la )?couleur|seulement (?:la )?couleur|dans la gamme couleur|gamme couleur|juste (?:la )?couleur|en couleur)$/.test(q);
+  if(!wantsColorRange)return null;
+  const previous=(Array.isArray(history)?[...history].reverse():[])
+    .filter(x=>typeof x==='string')
+    .map(x=>x.replace(/^Client\s*:\s*/i,'').trim())
+    .find(x=>{const f=parseCatalogFilters(x);return f.family==='Cover Styl' && Boolean(f.color);});
+  if(!previous)return {missingContext:true};
+  const f=parseCatalogFilters(previous);
+  // Les valeurs contrôlées proviennent du parseur et ne peuvent pas être
+  // injectées librement par le modèle IA.
+  return {question:`Cover Styl ${f.color} dans la gamme Couleur`};
+}
+
 async function advise(question, history=[]){
   if(!snapshot.updatedAt) {
     // En cas de démarrage à froid, le premier catalogue doit être chargé.
@@ -335,9 +354,20 @@ async function advise(question, history=[]){
     // Le catalogue déjà chargé reste exploitable pendant son actualisation.
     void syncCatalog();
   }
+  const refinement=refineCatalogQuestion(question,history);
+  if(refinement?.missingContext){
+    return {reply:'Vous souhaitez uniquement la gamme Couleur : quelle couleur et quelle famille recherchez-vous ?',products:[],source:'clarification'};
+  }
+  if(refinement?.question){
+    return catalogueListing(refinement.question);
+  }
   // Sur une précision courte, les critères obligatoires viennent du besoin précédent,
   // tandis que la couleur ne peut pas remplacer ces critères.
   const followup=parseFollowup(question);
+  if(followup){
+    const nested=refineCatalogQuestion(followup.value,[`Client : ${followup.goal}`,...history]);
+    if(nested?.question)return catalogueListing(nested.question);
+  }
   const effectiveQuestion=followup?followup.goal:question;
   // Les critères obligatoires proviennent du besoin actif, jamais des autres anciens projets.
   // Ne jamais réinjecter un ancien besoin rejeté dans les filtres.
