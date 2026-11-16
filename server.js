@@ -118,7 +118,10 @@ function eligible(p,c){
 }
 function shortlist(question){
   const c=getConstraints(question), q=norm(question), tokens=q.split(' ').filter(t=>t.length>3&&!['cherche','pour','avec','dans','sans','produit','besoin','veux','film'].includes(t));
-  const products=snapshot.products.filter(p=>eligible(p,c)).map(p=>{
+  const filters=parseCatalogFilters(question);
+  // Les exigences explicites de famille, couleur et finition sont des filtres
+  // stricts également pour les réponses générées par Gemini.
+  const products=snapshot.products.filter(p=>eligible(p,c) && familyMatches(p,filters.family) && matchColor(p,filters.color) && matchSubtype(p,filters.subtype)).map(p=>{
     const name=norm(p.title), tags=norm(p.tags+' '+p.type), desc=norm(p.description);
     let score=0;for(const t of tokens){if(name.includes(t))score+=8;if(tags.includes(t))score+=5;if(desc.includes(t))score+=1;}
     if(c.sansColle && /sans colle|electrostatique/.test(name+' '+tags))score+=15;
@@ -207,8 +210,13 @@ function familyMatches(p,family){
 }
 function matchColor(p,color){
   if(!color)return true;
-  const names=norm(p.title+' '+p.tags);
-  return Boolean(COLORS.find(c=>c.name===color)?.re.test(names));
+  // Couleur confirmée : la recherche publique ne dispose pas du métachamp couleur Shopify.
+  // Utiliser UNIQUEMENT la couleur explicitement indiquée dans le TITRE.
+  // Les tags contiennent aussi Green/Orange pour les gammes Cover Styl,
+  // qui ne désignent pas la couleur du produit. Ne jamais déduire une couleur
+  // à partir d'un nom commercial (ex. Obsidian) ou d'une photo.
+  const title=norm(p.title);
+  return Boolean(COLORS.find(c=>c.name===color)?.re.test(title));
 }
 function matchSubtype(p,subtype){
   if(!subtype)return true;
@@ -240,12 +248,12 @@ function listContext(question){
 function listingRequest(question){
   const q=norm(question),f=parseCatalogFilters(question);
   // Toute recherche explicite de gamme/couleur peut se parcourir sans IA.
-  return f.hasCriteria && (/(\b(tous|toutes|liste|references|gamme|coloris|couleurs)\b)/.test(q) || (f.family==='Cover Styl' && Boolean(f.color)));
+  return f.hasCriteria && (/(\b(tous|toutes|liste|references|gamme|coloris|couleurs)\b)/.test(q) || Boolean(f.color && f.family));
 }
 function catalogueListing(question){
   const result=searchCatalog(question);
-  const summary=result.total ? `${result.total} références identifiées dans le catalogue pour « ${searchLabel(result.filters)} ». Voici une sélection ; vous pouvez ouvrir la liste complète ci-dessous.` : 'Je ne trouve aucune fiche portant ces critères vérifiables dans les informations disponibles. Essayez de préciser une famille ou une caractéristique.';
-  return {reply:summary,products:result.products.slice(0,4).map(publicProduct),source:'catalogue-preview',viewAll:result.total>4?listContext(question):null};
+  const summary=result.total ? `${result.total} référence${result.total>1?'s':''} dont la couleur est explicitement mentionnée dans le titre pour « ${searchLabel(result.filters)} ». Voici les premières références. Cette liste peut être incomplète : les couleurs non documentées dans le titre ne sont pas comptées.` : 'Aucune référence ne mentionne explicitement cette couleur dans son titre. Je ne peux pas confirmer la couleur d’autres produits à partir de leur nom commercial ou de leur photo. Les filtres de couleur Shopify sont nécessaires pour une liste exhaustive.';
+  return {reply:summary,products:result.products.slice(0,4).map(publicProduct),source:'catalogue-preview',viewAll:result.total>0?listContext(question):null};
 }
 // Reconstitue une précision courte envoyée par l'interface (ex. « bla,n » => « blanc »).
 // L'ancienne demande reste le cahier des charges ; la précision est une préférence.
