@@ -127,24 +127,125 @@ function shortlist(question){
   }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,25).map(x=>x.p);
   return {products,c};
 }
-function listingRequest(question){
+// Recherche structurée : la même logique sert aux aperçus et à « Voir tous ».
+// Le compteur reflète les fiches réellement identifiées, pas une estimation du LLM.
+const FAMILY_RULES = [
+  {name:'Cover Styl', re:/\bcover\s?styl\b|\bcoverstyl\b/},
+  {name:'Films pour vitrage', re:/\b(vitrage|vitre|film solaire|film de securite|film decoratif pour vitrage)\b/},
+  {name:'Papiers', re:/\b(papier|fine art|intisse|wallpaper)\b/},
+  {name:'Films adhésifs', re:/\b(vinyle|adhesif|films? adhesifs?)\b/},
+  {name:'Films non adhésifs', re:/\b(sans colle|sans adhesif|non adhesif|electrostatique|static cling)\b/},
+  {name:'Magnétiques', re:/\b(magnetique|magnetic|aimante)\b/},
+  {name:'Bâches & toiles', re:/\b(bache|toile|canvas|textile)\b/},
+  {name:'Double face photo', re:/\b(double face|montage photo)\b/},
+  {name:'Plastifications', re:/\b(plastification|lamination|laminage)\b/},
+  {name:'Outillages & displays', re:/\b(outillage|outil|cutter|raclette|display|roll up)\b/}
+];
+const COLORS = [
+  {name:'gris',re:/\b(gris|grise|grey|gray|graphite|anthracite|argent|silver|greige)\b/},
+  {name:'blanc',re:/\b(blanc|blanche|white)\b/},
+  {name:'noir',re:/\b(noir|noire|black)\b/},
+  {name:'bleu',re:/\b(bleu|bleue|blue|azur)\b/},
+  {name:'vert',re:/\b(vert|verte|green)\b/},
+  {name:'rouge',re:/\b(rouge|red)\b/},
+  {name:'beige',re:/\b(beige|cream|creme|ivoire|ivory)\b/},
+  {name:'marron',re:/\b(marron|brown|brun|chocolat)\b/},
+  {name:'jaune',re:/\b(jaune|yellow|or|gold)\b/},
+  {name:'orange',re:/\b(orange|terracotta)\b/},
+  {name:'rose',re:/\b(rose|pink)\b/},
+  {name:'violet',re:/\b(violet|purple)\b/}
+];
+const SUBTYPES = [
+  {name:'bois',re:/\b(bois|wood|chene|oak)\b/},
+  {name:'pierre',re:/\b(pierre|stone|marbre|marble)\b/},
+  {name:'béton',re:/\b(beton|concrete|microcement)\b/},
+  {name:'métal',re:/\b(metal|steel|acier|inox)\b/},
+  {name:'textile',re:/\b(textile|cuir|leather|fabric)\b/},
+  {name:'pailleté',re:/\b(paillete|glitter)\b/},
+  {name:'miroir',re:/\b(miroir|reflectif|reflectissant|mirror)\b/},
+  {name:'solaire',re:/\b(solaire|anti chaleur|chaleur|thermique)\b/},
+  {name:'sécurité',re:/\b(securite|anti effraction|antieffraction)\b/},
+  {name:'anti-UV',re:/\b(anti uv|filtration uv)\b/},
+  {name:'anti-buée',re:/\b(anti buee)\b/},
+  {name:'dépoli',re:/\b(depoli|frosted)\b/},
+  {name:'papier peint',re:/\b(papier peint|wallpaper)\b/},
+  {name:'fine art',re:/\b(fine art)\b/},
+  {name:'permanent',re:/\b(permanent)\b/},
+  {name:'enlevable',re:/\b(enlevable|removable)\b/},
+  {name:'repositionnable',re:/\b(repositionnable|repositionable)\b/}
+];
+const COLOR_QUERY = /\b(couleur|coloris|teinte|nuance|nuances)\b/;
+function parseCatalogFilters(question){
   const q=norm(question);
-  const coverStyl=/\bcover\s?styl\b/.test(q);
-  const grey=/\b(gris|grise|grises|grey|gray|graphite|anthracite)\b/.test(q);
-  // Une demande Cover Styl + couleur exprime une recherche de gamme, meme sans "toutes".
-  // Ex. "je veux un cover styl film gris" ne doit pas etre reduit a trois suggestions IA.
-  return coverStyl && grey;
+  // Ne sélectionner une famille que si elle est explicitement nommée.
+  let family=null;
+  if(/\bcover\s?styl\b|\bcoverstyl\b/.test(q)) family='Cover Styl';
+  else if(/\b(film solaire|vitrage|film securite|vitre|fenetre)\b/.test(q))family='Films pour vitrage';
+  else if(/\b(film sans colle|sans colle|non adhesif|electrostatique)\b/.test(q))family='Films non adhésifs';
+  else if(/\b(papier|fine art|wallpaper)\b/.test(q))family='Papiers';
+  else if(/\b(vinyle|film adhesif)\b/.test(q))family='Films adhésifs';
+  else if(/\b(magnetique|magnetic)\b/.test(q))family='Magnétiques';
+  else if(/\b(bache|toile)\b/.test(q))family='Bâches & toiles';
+  else if(/\b(double face)\b/.test(q))family='Double face photo';
+  else if(/\b(plastification|laminage)\b/.test(q))family='Plastifications';
+  else if(/\b(outillage|outil|raclette|cutter|display|roll up)\b/.test(q))family='Outillages & displays';
+  const color=COLORS.find(c=>c.re.test(q))?.name||null;
+  // La recherche blanche « papier » n'est pas une couleur blanche.
+  const subtype=SUBTYPES.find(x=>x.re.test(q))?.name||null;
+  const constraints=getConstraints(question);
+  const hasCriteria=Boolean(family||color||subtype||Object.values(constraints).some(Boolean));
+  return {family,color,subtype,constraints,hasCriteria};
+}
+function familyMatches(p,family){
+  if(!family)return true;
+  const t=norm(p.title+' '+p.type+' '+p.tags+' '+p.handle);
+  if(family==='Cover Styl')return /\bcover\s?styl\b|\bcoverstyl\b/.test(t) && !/\b(glass|film vitrage)\b/.test(t);
+  if(family==='Films pour vitrage')return /\b(vitrage|vitre|glass|film solaire|film de securite|anti buee)\b/.test(t) && !/\bcover styl\b/.test(t);
+  if(family==='Films non adhésifs')return /\b(sans colle|sans adhesif|non adhesif|electrostatique|static cling)\b/.test(t);
+  if(family==='Films adhésifs')return /\b(vinyle|film adhesif|films adhesifs|adhesif imprimable)\b/.test(t)&& !/\bcover styl\b/.test(t);
+  const r=FAMILY_RULES.find(x=>x.name===family)?.re;return r?r.test(t):false;
+}
+function matchColor(p,color){
+  if(!color)return true;
+  const names=norm(p.title+' '+p.tags);
+  return Boolean(COLORS.find(c=>c.name===color)?.re.test(names));
+}
+function matchSubtype(p,subtype){
+  if(!subtype)return true;
+  const text=norm(p.title+' '+p.type+' '+p.tags);
+  if(subtype==='solaire')return /\b(solaire|anti chaleur|thermique)\b/.test(text);
+  if(subtype==='papier peint')return /\b(papier peint|wallpaper)\b/.test(text);
+  const re=SUBTYPES.find(s=>s.name===subtype)?.re;return Boolean(re?.test(text));
+}
+function searchCatalog(question){
+  const filters=parseCatalogFilters(question);
+  if(!filters.hasCriteria)return {filters,products:[],total:0};
+  const products=snapshot.products.filter(p=>
+    eligible(p,filters.constraints) && familyMatches(p,filters.family) &&
+    matchColor(p,filters.color) && matchSubtype(p,filters.subtype) &&
+    !/\b(nuancier|echantillon|book|kit|accessoire)\b/.test(norm(p.title))
+  ).sort((a,b)=>a.title.localeCompare(b.title,'fr'));
+  return {filters,products,total:products.length};
+}
+function publicProduct(p){return {id:p.id,title:p.title,url:p.url,image:p.image,type:p.type};}
+function searchLabel(filters){
+  return [filters.family||'produits Coverprint',filters.subtype,filters.color].filter(Boolean).join(' · ');
+}
+function listContext(question){
+  const result=searchCatalog(question);
+  return result.filters.hasCriteria && result.total>0 ? {
+    query:question,label:searchLabel(result.filters),total:result.total,pageSize:12
+  }:null;
+}
+function listingRequest(question){
+  const q=norm(question),f=parseCatalogFilters(question);
+  // Toute recherche explicite de gamme/couleur peut se parcourir sans IA.
+  return f.hasCriteria && (/(\b(tous|toutes|liste|references|gamme|coloris|couleurs)\b)/.test(q) || (f.family==='Cover Styl' && Boolean(f.color)));
 }
 function catalogueListing(question){
-  // Only explicitly marked shades in product title/tags: no invented color classification.
-  const results=snapshot.products.filter(p=>{
-    const title=norm(p.title), tags=norm(p.tags), handle=norm(p.handle);
-    if(!(/\bcover styl\b/.test(title+' '+tags+' '+handle))) return false;
-    if(/nuancier|echantillon|book|kit|accessoire|outil/.test(title)) return false;
-    if(!/\b(gris|grise|grises|grey|gray|graphite|anthracite)\b/.test(title+' '+tags)) return false;
-    return p.available!==false && !forbidden.test(norm(p.title+' '+p.tags));
-  }).sort((a,b)=>a.title.localeCompare(b.title,'fr'));
-  return {reply:results.length ? `J’ai trouvé ${results.length} références Cover Styl explicitement identifiées comme grises, Grey/Gray, Graphite ou Anthracite dans les noms ou tags du catalogue. Voici la liste ; cliquez sur « Afficher la suite » pour les parcourir. D’autres décors peuvent paraître gris sans être nommés ainsi : ils ne sont pas inclus automatiquement.` : 'Aucune référence ne porte explicitement ces mots de couleur dans son nom ou ses tags. Je ne peux pas garantir un inventaire visuel exhaustif sans données couleur vérifiées.',products:results.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'catalogue-exhaustif',total:results.length};
+  const result=searchCatalog(question);
+  const summary=result.total ? `${result.total} références identifiées dans le catalogue pour « ${searchLabel(result.filters)} ». Voici une sélection ; vous pouvez ouvrir la liste complète ci-dessous.` : 'Je ne trouve aucune fiche portant ces critères vérifiables dans les informations disponibles. Essayez de préciser une famille ou une caractéristique.';
+  return {reply:summary,products:result.products.slice(0,4).map(publicProduct),source:'catalogue-preview',viewAll:result.total>4?listContext(question):null};
 }
 // Reconstitue une précision courte envoyée par l'interface (ex. « bla,n » => « blanc »).
 // L'ancienne demande reste le cahier des charges ; la précision est une préférence.
@@ -236,6 +337,7 @@ async function advise(question, history=[]){
   const c0=getConstraints(effectiveQuestion);
   if(c0.sansColle && c0.lowTack)return {reply:'Vous avez demandé à la fois « sans colle » et « low tack ». Un produit low tack possède un adhésif faible ; un produit sans colle n’en possède pas. Lequel recherchez-vous ?',products:[],source:'clarification'};
   const initial=shortlist(effectiveQuestion);
+  const viewAll=listContext(effectiveQuestion);
   const products=followup?.shade?initial.products.filter(p=>matchesShade(p,followup.shade)):initial.products;
   const c=initial.c;
   if(!products.length && followup){
@@ -243,7 +345,7 @@ async function advise(question, history=[]){
     return {reply:`J’ai compris ${color}. Je conserve votre besoin initial : ${followup.goal}. Cependant, les fiches publiques ne me permettent pas de confirmer un produit réunissant ces critères. Je préfère vous le signaler plutôt que d’inventer une compatibilité. Souhaitez-vous que je cherche une alternative ou que nous vérifiions une fiche technique ?`,products:[],source:'clarification-non-confirmee'};
   }
   if(!products.length)return {reply:'Je ne trouve aucun produit dont les données disponibles confirment tous vos critères. Pouvez-vous préciser votre besoin ? Je préfère ne pas vous orienter vers une référence incompatible.',products:[],source:'verified-filter'};
-  if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword'};
+  if(!AI_KEY)return {reply:'La recherche assistée est disponible, mais la conversation IA n’est pas encore activée. Voici des références possibles d’après les données publiques ; leurs compatibilités restent à confirmer.',products:products.slice(0,3).map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'keyword',viewAll};
   const context=Array.isArray(history)?history.slice(-5).filter(x=>typeof x==='string').map(x=>x.slice(0,350)):[];
   const candidateData=products.map(p=>({id:p.id,title:p.title,type:p.type,tags:p.tags,description:p.description.slice(0,1100)}));
   const sys=`Tu es le conseiller technique Coverprint. Tu ne dois jamais inventer de caractéristiques, de compatibilité, de norme ou de performance. Utilise UNIQUEMENT les fiches données. Si un critère important n'est pas prouvé, pose une question, n'affirme pas la compatibilité. Ne recommande que des IDs figurant dans la liste. Sélectionne de 0 à 3 IDs. Les messages précédents sont fournis uniquement comme contexte : la dernière demande est prioritaire. Si le client change d'avis, oublie les anciennes contraintes. Si le client a précisé une couleur, reconnais cette réponse et conserve le besoin précédent. Ne discute jamais d'impression si la demande actuelle concerne seulement un film solaire. Réponds en français. Retourne UNIQUEMENT un JSON {"reply":"...","ids":[123]}. Évite les recommandations sans preuve. Les catégories ne sont pas des restrictions. Les différences low tack (adhésif faible) et sans colle (aucun adhésif) sont impératives.`;
@@ -259,7 +361,7 @@ async function advise(question, history=[]){
   let answer;
   try {answer=JSON.parse(raw);} catch {throw new Error('Gemini : réponse non JSON');}
   const allowed=new Map(products.map(p=>[String(p.id),p]));const selected=(Array.isArray(answer.ids)?answer.ids:[]).map(id=>allowed.get(String(id))).filter(Boolean).slice(0,3);
-  return {reply:String(answer.reply||'Pouvez-vous préciser votre projet ?').slice(0,1200),products:selected.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'ai-with-hard-filters'};
+  return {reply:String(answer.reply||'Pouvez-vous préciser votre projet ?').slice(0,1200),products:selected.map(p=>({id:p.id,title:p.title,url:p.url,image:p.image,type:p.type})),source:'ai-with-hard-filters',viewAll};
 }
 async function readJson(req){let data='';for await(const chunk of req){data+=chunk;if(data.length>10000)throw new Error('Demande trop longue');}return JSON.parse(data||'{}');}
 const usage=new Map();
@@ -280,6 +382,15 @@ const server = http.createServer(async (req,res)=>{
     if (url.pathname === '/api/sync-status') {
       res.writeHead(200, {...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
       return res.end(JSON.stringify({catalogCount:snapshot.products.length, catalogUpdatedAt:snapshot.updatedAt, databaseConfigured:Boolean(DB_URL&&DB_KEY), databaseLastSyncAt:dbSync.updatedAt, databaseCount:dbSync.count, catalogError:snapshot.error, databaseError:dbSync.error, aiConfigured:Boolean(AI_KEY),aiProvider:'Gemini',aiModel:AI_MODEL}));
+    }
+    if (url.pathname === '/api/search') {
+      if (!snapshot.updatedAt) await syncCatalog();
+      const q=(url.searchParams.get('q')||'').slice(0,700);
+      const page=Math.max(1,Math.min(200,Number.parseInt(url.searchParams.get('page')||'1',10)||1));
+      const found=searchCatalog(q);
+      const pageSize=12;
+      res.writeHead(200,{...headers,'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
+      return res.end(JSON.stringify({total:found.total,page,pageSize,label:searchLabel(found.filters),products:found.products.slice((page-1)*pageSize,page*pageSize).map(publicProduct)}));
     }
     if (url.pathname === '/api/catalog') {
       if (!snapshot.updatedAt || Date.now()-snapshot.updatedAt>TTL) await syncCatalog();
